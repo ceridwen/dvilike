@@ -12,8 +12,8 @@ from construct.core import (_read_stream, _write_stream)
 
 # Debugging
 import pdb
-import pympler.asizeof
-import pympler.classtracker
+# import pympler.asizeof
+# import pympler.classtracker
 from construct.lib import Container, ListContainer
 
 # Other
@@ -399,7 +399,7 @@ class DVILikeProcessor(abc.ABC):
         #        self.File = GreedyRange(PacketSwitch(None, self._opcodes))
 
     @classmethod
-    def Process(cls, data):
+    def process(cls, data):
         def descendants(ancestor):
             yield from set(ancestor.__subclasses__()) | {c for s in ancestor.__subclasses__() for c in descendants(s)}
 
@@ -619,7 +619,7 @@ class VFProcessor(VFDVIProcessor):
         #                'post' : {'chars' : 'end'}}
         self.Font = PacketSwitch(None, DictLikeChainMap(self.FONT_DEF_OPCODES, self.CHAR_OPCODES))
         self.Char = PacketSwitch(None, DictLikeChainMap(self.CHAR_OPCODES, {248 : VFPost}))
-        actions = {'start' : self.Preamble.parse_stream, 'fonts' : Font.parse_stream, 'chars' : Char.parse_stream}
+        actions = {'start' : self.Preamble.parse_stream, 'fonts' : self.Font.parse_stream, 'chars' : self.Char.parse_stream}
         transitions = {('pre',): {'start' : 'fonts'}, 
                        ('fnt_def',) : {'fonts': 'fonts'},
                        ('short_char', 'long_char') : {'fonts' : 'chars', 
@@ -1024,7 +1024,7 @@ class DVILikeMachine:
 
 
 class OpcodeCommandsMachine:
-    """ Use by calling the constructor, then feeding execute() commands as Construct Containers one at a time."""
+    """ Use by calling the constructor, then feeding the instance commands as Construct Containers one at a time."""
     def __init__(self):
         self._commands = {'fnt_def' : self.fnt_def,
                           'pre' : self.pre,
@@ -1131,11 +1131,11 @@ class OpcodeCommandsMachine:
 if __name__ == "__main__":
 
     # file = 'DroidSerif-Regular-ot1.vf'
-    # file = 'extending_hardys_proof.dvi'
+    file = 'extending_hardys_proof.dvi'
     # file = 'testsuite/F-alias-feature-option.xdv'
     # file = '02_xits_fonts.xdv'
     # file = 'droid-test.dvi'
-    file = 'pcml-16.dvi'
+    # file = 'pcml-16.dvi'
 
     with open(file, 'rb') as f:
         test = DVILikeProcessor.Process(f)
