@@ -1,19 +1,32 @@
 #!/usr/bin/python3
 
-from construct import (Adapter, Array, BitStruct, Construct, Debugger, Embed,
-                       Field, FieldError, Flag, GreedyRange, If, Magic,
-                       OptionalGreedyRange, Padding, PascalString, Pass, Probe, Range, RepeatUntil,
-                       Sequence, StaticField, String, Struct, Switch, Terminator, UBInt8,
-                       UBInt16, SBInt32, UBInt32, Value)
+from construct import (Adapter, Anchor, Array, BitStruct, Byte,
+                       ConstructError, Debugger, Embed, Enum, Field,
+                       FieldError, Flag, GreedyRange, If,
+                       OptionalGreedyRange, Padding, PascalString,
+                       Pass, Probe, Range, RepeatUntil, Sequence,
+                       StaticField, String, Struct, Switch,
+                       Terminator, Tunnel, UBInt16, SBInt32, UBInt32,
+                       Value)
+from construct.core import (_read_stream, _write_stream)
+
+# Debugging
+import pdb
+import pympler.asizeof
+import pympler.classtracker
+from construct.lib import Container, ListContainer
+
+# Other
 import sys
 import io
-import pdb
 import collections
-
+import abc
+import itertools
+import collections.abc
 
 # The high-high level architecture of this program works like:
 
-# DVILikeTranslator parses a file to create a representation in Python.
+# DVILikeProcessor parses a file to create a representation in Python.
 
 # DVILikeMachine transforms the representation into another form, like
 # hypothetically text (DVIasm, dvitype), an SVG file (dvisvgm), or
@@ -90,26 +103,6 @@ class IntField(StaticField):
             raise FieldError(sys.exc_info()[1])
 
 
-# The following two functions are copied verbatim from
-# construct/core.py.  They're called in FormatField and serve the same
-# function in IntField but aren't part of the external interface to
-# the construct module, so I had to duplicate the code here.
-def _read_stream(stream, length):
-    if length < 0:
-        raise ValueError("length must be >= 0", length)
-    data = stream.read(length)
-    if len(data) != length:
-        raise FieldError("expected %d, found %d" % (length, len(data)))
-    return data
-
-def _write_stream(stream, length, data):
-    if length < 0:
-        raise ValueError("length must be >= 0", length)
-    if len(data) != length:
-        raise FieldError("expected %d, found %d" % (length, len(data)))
-    stream.write(data)
-
-
 def UBInt24(name):
     """Unsigned, big endian 24-bit integer"""
     return IntField(name, 3, 'big', False)
@@ -144,68 +137,72 @@ class FixWord(Adapter):
         return int(obj*2**20)
 
 
-class TransformMatrix(Adapter):
-    """ Converts an array of integers from and to a matrix of floats.
+# class VFDVIAdapter(Adapter):
+#     """ Converts DVI code to and from a container.
 
-    Xetex's pic_file command includes a transformation matrix for the
-    image.  The code to read it is in xdvipdfmx's dvi.c in
-    do_pic_file() on lines 1978-1843, with the comment, "transform is
-    a 3x2 affine transform matrix expressed in fixed-point values."
-    This Adapter wraps an Array of integers.
+#     VF files embed DVI code to typeset characters.  When included in a
+#     Construct, this Adapter instantiates a class with the necessary
+#     dictionary to process the DVI opcodes that can appear in VF files
+#     and uses that class's read_bytes and write_bytes methods to turn
+#     DVI code into a list of containers representing the DVI commands
+#     and vice versa.  These methods read all the DVI code for one
+#     character into memtory, and theoretically a VF file could contain
+#     up to 2^31 - 1 bytes (~4 GB) of DVI code for a single character.
+#     In practice, typesetting a single character should never require
+#     more than a couple dozen bytes of DVI code at the absolute
+#     maximum.  This Adapter wraps a bytes string.
+
+#     Note that Constructs including this Adapter must be instantiated
+#     inside a class or otherwise things break.
+#     """
+#     __slots__ = ['_translator']
+
+#     def __init__(self, *args, **kwargs):
+#         """ Instantiates the DVI translator and calls the parent init.
+
+#         The parent's __init__ must be called after the translator is
+#         instantiated, I assume because either Subconstruct or
+#         Construct do something with __slots__ that breaks if
+#         _translator isn't defined yet.
+#         """
+#         self._translator = VFDVIProcessor()
+#         Adapter.__init__(self, *args, **kwargs)
+
+#     def _decode(self, obj, context):
+#         return self._translator.read_bytes(obj)
+
+#     def _encode(self, obj, context):
+#         return self._translator.write_bytes(obj)
+
+
+class Magic(Adapter):
     """
-    def _decode(self, obj, context):
-        return [[float(obj[0])/2**16, float(obj[1])/2**16],
-                [float(obj[2])/2**16, float(obj[3])/2**16],
-                [float(obj[4])/2**16, float(obj[5])/2**16]]
+    Adapter for enforcing a constant value ("magic numbers"). When decoding,
+    the return value is checked; when building, the value is substituted in.
+
+    :param subcon: the subcon to validate
+    :param value: the expected value
+
+    Example::
+        Const(Field("signature", 2), "MZ")
+    """
+    __slots__ = ['value', 'error']
+
+    def __init__(self, value, error):
+        Adapter.__init__(self, Field(None, len(value)))
+        self.value = value
+        self.error = error
+
     def _encode(self, obj, context):
-        return [int(obj[0][0]*2**16), int(obj[0][1]*2**16),
-                int(obj[1][0]*2**16), int(obj[1][1]*2**16),
-                int(obj[2][0]*2**16), int(obj[2][1]*2**16)]
-
-
-class VFDVIAdapter(Adapter):
-    """ Converts DVI code to and from a container.
-
-    VF files embed DVI code to typeset characters.  When included in a
-    Construct, this Adapter instantiates a class with the necessary
-    dictionary to process the DVI opcodes that can appear in VF files
-    and uses that class's read_bytes and write_bytes methods to turn
-    DVI code into a list of containers representing the DVI commands
-    and vice versa.  These methods read all the DVI code for one
-    character into memtory, and theoretically a VF file could contain
-    up to 2^31 - 1 bytes (~4 GB) of DVI code for a single character.
-    In practice, typesetting a single character should never require
-    more than a couple dozen bytes of DVI code at the absolute
-    maximum.  This Adapter wraps a bytes string.
-
-    Note that Constructs including this Adapter must be instantiated
-    inside a class or otherwise things break.
-    """
-    __slots__ = ['_translator']
-
-    def __init__(self, *args, **kwargs):
-        """ Instantiates the DVI translator and calls the parent init.
-
-        The parent's __init__ must be called after the translator is
-        instantiated, I assume because either Subconstruct or
-        Construct do something with __slots__ that breaks if
-        _translator isn't defined yet.
-        """
-        self._translator = VFDVITranslator()
-        Adapter.__init__(self, *args, **kwargs)
+        if obj is None or obj == self.value:
+            return self.value
+        else:
+            raise self.error("expected %r, found %r" % (self.value, obj))
 
     def _decode(self, obj, context):
-        return self._translator.read_bytes(obj)
-
-    def _encode(self, obj, context):
-        return self._translator.write_bytes(obj)
-
-
-class PrintContext(Construct):
-    """ Debugging code
-    """
-    def _parse(self, stream, context):
-        print(context)
+        if obj != self.value:
+            raise self.error("expected %r, found %r" % (self.value, obj))
+        return obj
 
 
 def PacketSwitch(name, opcodes):
@@ -239,14 +236,14 @@ def PacketSwitch(name, opcodes):
     dictionary.
     """
     return Struct(name,
-                  UBInt8('opcode'),
+                  Byte('opcode'),
                   Embed(Switch('fields',
                                lambda ctx: ctx.opcode, 
                                opcodes)))
 
 def Packet(name, opcode, struct):
     return Struct(name,
-                  Magic(opcode.to_bytes(1, 'big')),
+                  Magic(opcode.to_bytes(1, 'big'), DVILikeError),
                   Embed(struct))
 
 
@@ -256,11 +253,11 @@ def Command(name):
 
 # Opcode factory functions
 
-def _zero_parameter_opcode(name):
-    return lambda *unused_args: Struct(None, Command(name))
+# def _zero_parameter_opcode(name):
+#     return lambda *unused_args: Struct(name, Command(name))
 
 def _one_parameter_opcode(name, parameter):
-    return lambda i, signed: Struct(None,
+    return lambda i, signed: Struct(name,
                                     Command(name),
                                     IntField(parameter, i, 'big', signed))
 
@@ -279,20 +276,13 @@ def _opcode_signed_quadruplet(opcodes, start, construct):
         opcodes[i] = construct(i - start + 1, True)
     
 def _opcode_signed_quintuplet(opcodes, start, name, parameter):
-    opcodes[start] = _zero_parameter_opcode(name)()
-    # opcodes[start] = Struct(None, Command(name))
+#    opcodes[start] = _zero_parameter_opcode(name)()
+    opcodes[start] = Struct(name, Command(name))
     _opcode_signed_quadruplet(opcodes, start + 1, _one_parameter_opcode(name, parameter))
 
 def _opcode_range(opcodes, start, stop, construct):
     for i in range(start, stop):
-        opcodes[i] = construct(i)
-
-def _union(*dicts):
-    """ Combines a tuple of dictionaries into one dictionary. """
-    union = {}
-    for d in dicts:
-        union.update(d)
-    return union
+        opcodes[i] = construct
 
 
 # Breaking down what opcodes are allowed where.
@@ -319,245 +309,39 @@ def _union(*dicts):
 # between pages, inside pages, and in the postamble.
 
 
-# Shared opcodes
+class DictLikeChainMap(collections.ChainMap):
+    """Adds the keys(), values(), and items() methods to a ChainMap."""
 
-def FntDef(i, signed):
-    return Struct(None,
-                  Command('fnt_def'),
-                  IntField('font_num', i, 'big', signed),
-                  SBInt32('checksum'),
-                  FixWord(SBInt32('scale_factor')),
-                  FixWord(SBInt32('design_size')),
-                  UBInt8('a'),
-                  UBInt8('l'),
-                  String('tex_name', lambda ctx: ctx.a + ctx.l, 'ascii'))
+    # These three classes implements something like PEP 3106
+    # (legacy.python.org/dev/peps/pep-3106/) for ChainMaps. For these
+    # purposes, I'm going to treat a ChainMap exactly like a
+    # dictionary with the same keys and the items and values
+    # corresponding to those keys.  If a value or item can't be
+    # accessed by any key, this won't return it.  The methods needed
+    # to implement view objects for a ChainMap are exactly those
+    # contained in the collections abstract base classes.
 
-_fnt_def_opcodes = {}
-_opcode_mixed_quadruplet(_fnt_def_opcodes, 243, FntDef)
+    def items(self):
+        return collections.abc.ItemsView(self)
 
+    def keys(self):
+        return collections.abc.KeysView(self)
 
-# VF opcodes
-
-# _vf_opcodes = {}
-
-def ShortChar(i):
-    return Struct(None,
-                  Command('short_char'),
-                  UBInt8('char_code'),
-                  FixWord(UBInt24('tfm_width')),
-                  VFDVIAdapter(Field('dvi_code', i)))
-
-# def VFPre():
-#     return Struct(None,
-#                   Command('pre'),
-#                   Magic(b'\312'), 
-#                   PascalString('comment', encoding = 'ascii'),
-#                   SBInt32('checksum'),
-#                   FixWord(SBInt32('design_size')))
-
-def VFPre():
-    return Struct(None,
-                  Command('pre'),
-                  Magic(b'\312'), 
-                  PascalString('comment', encoding = 'ascii'),
-                  SBInt32('checksum'),
-                  FixWord(SBInt32('design_size')))
+    def values(self):
+        return collections.abc.ValuesView(self)
 
 
-def VFPost():
-    return Struct(None,
-                  Command('post'),
-                  Range(0, 3, Magic(b'\370')),
-                  Terminator)
+FILE_TYPES = dict(DVI = 2, DVIV = 3, XDV = 5, PK = 131, VF = 202)
 
-# _vf_opcodes[247] = VFPre()
-# _vf_opcodes[248] = VFPost()
-
-
-# DVI opcodes
-
-_page_opcodes = {}
-
-def FntNum(i):
-    return Struct(None,
-                  Command('fnt_num'),
-                  Value('font_num', lambda ctx: ctx.opcode - 171))
-
-def Xxx(i, signed):
-    return Struct(None,
-                  Command('xxx'),
-                  PascalString('x', IntField('k', i, 'big', signed), 'ascii'))
-
-def DVIPre(id_byte):
-    return Struct(None,
-                  Command('pre'),
-                  Magic(id_byte),
-                  SBInt32('numerator'),
-                  SBInt32('denominator'),
-                  SBInt32('magnification'),
-                  PascalString('comment', encoding = 'ascii'))
-
-def PostPost(id_byte):
-    return Struct(None,
-                  Command('post_post'),
-                  SBInt32('q'),
-                  Magic(id_byte),
-                  Range(4, 7, Magic(b'\337')),
-                  Terminator)
-
-def Bop():
-    return Struct(None,
-                  Command('bop'),
-                  Array(10, SBInt32('c')),
-                  SBInt32('p'))
-
-def DVIPost():
-    return Struct(None,
-                  Command('post'),
-                  SBInt32('p'),
-                  SBInt32('numerator'),
-                  SBInt32('denominator'),
-                  SBInt32('magnification'),
-                  SBInt32('page_height_plus_depth'),
-                  SBInt32('page_width'),
-                  UBInt16('max_stack_depth'),
-                  UBInt16('total_pages'))
-
-_page_opcodes.update({132 : Struct(None,
-                                  Command('set_rule'),
-                                  SBInt32('height'),
-                                  SBInt32('width')),
-                     137 : Struct(None,
-                                  Command('put_rule'),
-                                  SBInt32('height'),
-                                  SBInt32('width')),
-                     138 : Pass,
-                     # 139 : Bop(),
-                     # 140 : Struct(None, Command('eop')),
-                     141 : Struct(None, Command('push')),
-                     142 : Struct(None, Command('pop')),
-                     # 248: DVIPost()
-                     })
-# _page_opcodes.update(_fnt_def_opcodes)
-
-_opcode_range(_page_opcodes, 0, 128, _zero_parameter_opcode('set_char'))
-# _opcode_range(_page_opcodes, 0, 128, Struct(None, Command('set_char')))
-_opcode_mixed_quadruplet(_page_opcodes, 128, _one_parameter_opcode('set',
-                                                                  'char_code'))
-_opcode_mixed_quadruplet(_page_opcodes, 133, _one_parameter_opcode('put',
-                                                                  'char_code'))
-_opcode_signed_quadruplet(_page_opcodes, 143, _one_parameter_opcode('right',
-                                                                   'b'))
-_opcode_signed_quintuplet(_page_opcodes, 147, 'w', 'b')
-_opcode_signed_quintuplet(_page_opcodes, 152, 'x', 'b')
-_opcode_signed_quadruplet(_page_opcodes, 157, _one_parameter_opcode('down', 'a'))
-_opcode_signed_quintuplet(_page_opcodes, 161, 'y', 'a')
-_opcode_signed_quintuplet(_page_opcodes, 166, 'z', 'a')
-_opcode_range(_page_opcodes, 171, 235, FntNum)
-_opcode_mixed_quadruplet(_page_opcodes, 235, _one_parameter_opcode('fnt',
-                                                                  'font_num'))
-_opcode_mixed_quadruplet(_page_opcodes, 239, Xxx)
+class DVILikeError(ConstructError):
+    pass
+class PreambleError(DVILikeError):
+    pass
+class PostambleError(DVILikeError):
+    pass
 
 
-# XDV opcodes
-
-_xdv_opcodes = {}
-
-def SetGlyph(name, construct):
-    return Struct(None,
-                  Command('set_glyph_' + name),
-                  SBInt32('width'),
-                  UBInt16('glyph_count'),
-                  Array(lambda ctx: ctx.glyph_count, construct),
-                  Array(lambda ctx: ctx.glyph_count,
-                        UBInt16('glyph_id')))
-
-def DefineNativeFont():
-    return Struct(None,
-                  Command('define_native_font'),
-                  UBInt32('font_num'),
-                  UBInt32('point_size'),
-                  Embed(BitStruct(None,
-                                  Padding(1),
-                                  Flag('embolden_flag'),
-                                  Flag('slant_flag'),
-                                  Flag('extend_flag'),
-                                  Flag('variations'),
-                                  Flag('features'),
-                                  Flag('colored'),
-                                  Flag('vertical'),
-                                  Padding(8))),
-                  UBInt8('lenps'),
-                  UBInt8('lenfam'),
-                  UBInt8('lensty'),
-                  String('ps_name',
-                         lambda ctx: ctx.lenps,
-                         'ascii'),
-                  String('family',
-                         lambda ctx: ctx.lenfam,
-                         'ascii'),
-                  String('style',
-                         lambda ctx: ctx.lensty,
-                         'ascii'),
-                  If(lambda ctx: ctx.colored,
-                     UBInt32('rgba')),
-                  If(lambda ctx: ctx.extend_flag,
-                     SBInt32('extend')),
-                  If(lambda ctx: ctx.slant_flag,
-                     SBInt32('slant')),
-                  If(lambda ctx: ctx.embolden_flag,
-                     SBInt32('embolden')),
-                  If(lambda ctx: ctx.variations,
-                     Embed(Struct(None,
-                                  UBInt16('nv'),
-                                  Array(lambda ctx: ctx.nv,
-                                        SBInt32('axes')),
-                                  Array(lambda ctx: ctx.nv,
-                                        SBInt32('values'))))))
-
-_xdv_opcodes[251] = Struct(None,
-                           Command('pic_file'),
-                           # TODO: This needs some commenting
-                           # to explain what this byte is,
-                           # see 1994 of dvi.c
-                           UBInt8('pdf_box'),
-                           TransformMatrix(Array(6,
-                                                 SBInt32('transform_matrix'))),
-                           UBInt16('page_number'),
-                           PascalString('path', UBInt16('length'), 'ascii'))
-_xdv_opcodes[252] = DefineNativeFont()
-_xdv_opcodes[253] = SetGlyph('array', Struct('loc',
-                                             SBInt32('x'),
-                                             SBInt32('y')))
-_xdv_opcodes[254] = SetGlyph('string', SBInt32('xloc'))
-
-
-def DVIFormat(id_byte, between_pages_opcodes, in_page_opcodes):
-    return Struct(None,
-                  Packet('pre', 247, DVIPre(id_byte)),
-                  OptionalGreedyRange(PacketSwitch('before_pages', between_pages_opcodes)),
-                  # The names in a Sequence are meaningless, but for
-                  # some reason they can't be None, so I used
-                  # one-element strings.
-                  OptionalGreedyRange(Sequence('page',
-                                               Packet('a', 139, Bop()),
-                                               OptionalGreedyRange(PacketSwitch('b', in_page_opcodes)),
-                                               Packet('c', 140, Struct(None, Command('eop'))),
-                                               OptionalGreedyRange(PacketSwitch('d', between_pages_opcodes)))),
-                  Packet('post', 248, DVIPost()),
-                  OptionalGreedyRange(PacketSwitch('fonts', between_pages_opcodes)),
-                  Packet('post_post', 249, PostPost(id_byte)))
-
-
-# def VFFormat():
-#     return Struct(None,
-#                   Packet(_vf_pre()),
-#                   OptionalGreedyRange(PacketSwitch(_fnt_def_opcodes)),
-#                   OptionalGreedyRange(PacketSwitch(_char_opcodes)),
-#                   Packet(_vf_post()))
-
-
-class DVILikeTranslator:
+class DVILikeProcessor(abc.ABC):
     """ Abstract class for parsing opcode-based TeX files like DVI files.
 
     The canonical references for the VF (virtual font) and DVI
@@ -583,167 +367,485 @@ class DVILikeTranslator:
     font numbers that haven't been defined, negative design sizes, or
     similar problems that require detailed parsing of the file.
     """
-    def __init__(self, data = b''):
-        raise NotImplementedError
-#        self.load(data)
-#        self._opcodes = {}
-#        self._file = GreedyRange(PacketSwitch(None, self._opcodes))
+    # DVIPre = Struct(None,
+    #                 SBInt32('numerator'),
+    #                 SBInt32('denominator'),
+    #                 SBInt32('magnification'),
+    #                 PascalString('comment', encoding = 'ascii'))
 
+    PreambleStart = Struct(None, Magic(b'\367', PreambleError),
+                           Enum(Byte('file_type'), **FILE_TYPES))
+
+                      # Embed(Switch('fields', lambda ctx: ctx.file_type, {
+                      #     VF = Struct(None,
+                      #                 PascalString('comment', encoding='ascii'),
+                      #                 SBInt32('checksum'),
+                      #                 FixWord(SBInt32('design_size'))),
+                      #     DVI = DVIPre,
+                      #     DVIV = DVIPre,
+                      #     XDV = DVIPre,
+                      #     PK = Struct(None,
+                      #                 PascalString('comment', encoding='ascii'))
+                      # })),
+                      # Anchor('preamble_end'))
+
+                      # file_type, 
+
+    @abc.abstractmethod
+    def __init__(self, data, file_type):
+        raise NotImplementedError
+        #        self.load(data)
+        #        self._opcodes = {}
+        #        self.File = GreedyRange(PacketSwitch(None, self._opcodes))
+
+    @classmethod
+    def Process(cls, data):
+        def descendants(ancestor):
+            yield from set(ancestor.__subclasses__()) | {c for s in ancestor.__subclasses__() for c in descendants(s)}
+
+        if all([hasattr(data, attr) for attr in ['read', 'seek', 'tell']]):
+            file_type = cls.PreambleStart.parse_stream(data).file_type
+        else:
+            file_type = cls.PreambleStart.parse(data).file_type
+        for subclass in descendants(cls):
+            if file_type in subclass.TYPES:
+                return subclass(data, file_type)
+        raise NameError('Processor not found for a ' + file_type + ' file.')
+
+#    @abc.abstractmethod
     def __iter__(self):
+        self._buffer.seek(0, 0)
+        self.command = self.Preamble.parse_stream(self._buffer).command
         return self
 
-    def __next__(self):
-        if self._end == self._buffer.tell():
-            self._buffer.seek(0,0)
-            raise StopIteration
-        return PacketSwitch(None, self._opcodes).parse_stream(self._buffer)
+    # @abc.abstractmethod
+    # def __next__(self):
+    #     if self._end == self._buffer.tell():
+    #         raise StopIteration
+    #     return PacketSwitch(None, self._opcodes).parse_stream(self._buffer)
 
     def load(self, data):
         if all([hasattr(data, attr) for attr in ['read', 'seek', 'tell']]):
             self._buffer = data
+            self._buffer.seek(0, 0)
         else:
             self._buffer = io.BytesIO(data)
-        self._end = self._buffer.seek(0, 2)
-        self._buffer.seek(0, 0)
-    
+        #        self._end = self._buffer.seek(0, 2)
+
     def read_file(self, infile):
-        return self._file.parse_stream(infile)
+        return self.File.parse_stream(infile)
 
     def read_bytes(self, inmemory):
-        return self._file.parse(inmemory)
+        return self.File.parse(inmemory)
 
     def write_file(self, container, outfile):
-        return self._file.build_stream(container, outfile)
+        return self.File.build_stream(container, outfile)
 
     def write_bytes(self, container):
-        return self._file.build(container)
+        return self.File.build(container)
+
+    # def _temp(self):
+    #     def FntDef(i, signed):
+    #         return Struct('fnt_def',
+    #                       Command('fnt_def'),
+    #                       IntField('font_num', i, 'big', signed),
+    #                       SBInt32('checksum'),
+    #                       FixWord(SBInt32('scale_factor')),
+    #                       FixWord(SBInt32('design_size')),
+    #                       Byte('a'),
+    #                       Byte('l'),
+    #                       String('tex_name', lambda ctx: ctx.a+ctx.l, 'ascii'))
+    #     self.FONT_DEF_OPCODES = {}
+    #     _opcode_mixed_quadruplet(self.FONT_DEF_OPCODES, 243, FntDef)
+
+    #     self.DVI_OPCODES = {}
+    #     self.DVI_OPCODES.update({132 : Struct('set_rule',
+    #                                            Command('set_rule'),
+    #                                            SBInt32('height'),
+    #                                            SBInt32('width')),
+    #                               137 : Struct('put_rule',
+    #                                            Command('put_rule'),
+    #                                            SBInt32('height'),
+    #                                            SBInt32('width')),
+    #                               138 : Pass,
+    #                               141 : Struct('push', Command('push')),
+    #                               142 : Struct('pop', Command('pop'))
+    #                           })
+
+    #     FntNum = Struct('fnt_num',
+    #                     Command('fnt_num'),
+    #                     Value('font_num', lambda ctx: ctx.opcode - 171))
+    #     _opcode_range(self.DVI_OPCODES, 0, 128, Struct('set_char',
+    #                                                     Command('set_char')))
+    #     _opcode_range(self.DVI_OPCODES, 171, 235, FntNum)
+
+    #     def Xxx(i, signed):
+    #         return Struct('xxx',
+    #                       Command('xxx'),
+    #                       PascalString('x',
+    #                                    IntField('k', i, 'big', signed),
+    #                                    'ascii'))
+ 
+    #     _opcode_mixed_quadruplet(self.DVI_OPCODES, 128,
+    #                              _one_parameter_opcode('set', 'char_code'))
+    #     _opcode_mixed_quadruplet(self.DVI_OPCODES, 133,
+    #                              _one_parameter_opcode('put', 'char_code'))
+    #     _opcode_signed_quadruplet(self.DVI_OPCODES, 143,
+    #                               _one_parameter_opcode('right', 'b'))
+    #     _opcode_signed_quintuplet(self.DVI_OPCODES, 147, 'w', 'b')
+    #     _opcode_signed_quintuplet(self.DVI_OPCODES, 152, 'x', 'b')
+    #     _opcode_signed_quadruplet(self.DVI_OPCODES, 157,
+    #                               _one_parameter_opcode('down', 'a'))
+    #     _opcode_signed_quintuplet(self.DVI_OPCODES, 161, 'y', 'a')
+    #     _opcode_signed_quintuplet(self.DVI_OPCODES, 166, 'z', 'a')
+    #     _opcode_mixed_quadruplet(self.DVI_OPCODES, 235,
+    #                              _one_parameter_opcode('fnt', 'font_num'))
+    #     _opcode_mixed_quadruplet(self.DVI_OPCODES, 239, Xxx)
 
 
+class VFDVIProcessor(DVILikeProcessor):
+    TYPES = []
 
-class VFTranslator(DVILikeTranslator):
-    def __init__(self, data = b''):
-        # DVILikeTranslator.__init__(self, data)
-        self.load(data)
-        self._char_opcodes = {}
-        self._char_opcodes[242] = Struct(None,
-                                         Command('long_char'),
-                                         SBInt32('dvi_length'),
-                                         SBInt32('char_code'),
-                                         FixWord(SBInt32('tfm_width')),
-                                         VFDVIAdapter(Field('dvi_code',
-                                                            lambda ctx: ctx.dvi_length)))
-        _opcode_range(self._char_opcodes, 0, 242, ShortChar)
-        self.state = 'start'
-        self._file = Struct(None,
-                            Packet('pre', 247, VFPre()),
-                            OptionalGreedyRange(PacketSwitch('fonts', _fnt_def_opcodes)),
-                            OptionalGreedyRange(PacketSwitch('chars', self._char_opcodes)),
-                            Packet('post', 248, VFPost()))
-        self._opcodes0 = {}
-        self._opcodes0.update(_fnt_def_opcodes)
-        self._opcodes0.update(self._char_opcodes)
-        self._opcodes1 = {}
-        self._opcodes1.update(self._char_opcodes)
-        self._opcodes1[248] = VFPost()
-        self._state0 = PacketSwitch(None, self._opcodes0)
-        self._state1 = PacketSwitch(None, self._opcodes1)
+    def __init__(self):
+#    def _temp(self):
+        def FntDef(i, signed):
+            return Struct('fnt_def',
+                          Command('fnt_def'),
+                          IntField('font_num', i, 'big', signed),
+                          SBInt32('checksum'),
+                          FixWord(SBInt32('scale_factor')),
+                          FixWord(SBInt32('design_size')),
+                          Byte('a'),
+                          Byte('l'),
+                          String('tex_name', lambda ctx: ctx.a+ctx.l, 'ascii'))
+        self.FONT_DEF_OPCODES = {}
+        _opcode_mixed_quadruplet(self.FONT_DEF_OPCODES, 243, FntDef)
 
-#    def __next__(self):
+        self.DVI_OPCODES = {}
+        self.DVI_OPCODES.update({132 : Struct('set_rule',
+                                               Command('set_rule'),
+                                               SBInt32('height'),
+                                               SBInt32('width')),
+                                  137 : Struct('put_rule',
+                                               Command('put_rule'),
+                                               SBInt32('height'),
+                                               SBInt32('width')),
+                                  138 : Pass,
+                                  141 : Struct('push', Command('push')),
+                                  142 : Struct('pop', Command('pop'))
+                              })
+
+        FntNum = Struct('fnt_num',
+                        Command('fnt_num'),
+                        Value('font_num', lambda ctx: ctx.opcode - 171))
+        _opcode_range(self.DVI_OPCODES, 0, 128, Struct('set_char',
+                                                        Command('set_char')))
+        _opcode_range(self.DVI_OPCODES, 171, 235, FntNum)
+
+        def Xxx(i, signed):
+            return Struct('xxx',
+                          Command('xxx'),
+                          PascalString('x',
+                                       IntField('k', i, 'big', signed),
+                                       'ascii'))
+ 
+        _opcode_mixed_quadruplet(self.DVI_OPCODES, 128,
+                                 _one_parameter_opcode('set', 'char_code'))
+        _opcode_mixed_quadruplet(self.DVI_OPCODES, 133,
+                                 _one_parameter_opcode('put', 'char_code'))
+        _opcode_signed_quadruplet(self.DVI_OPCODES, 143,
+                                  _one_parameter_opcode('right', 'b'))
+        _opcode_signed_quintuplet(self.DVI_OPCODES, 147, 'w', 'b')
+        _opcode_signed_quintuplet(self.DVI_OPCODES, 152, 'x', 'b')
+        _opcode_signed_quadruplet(self.DVI_OPCODES, 157,
+                                  _one_parameter_opcode('down', 'a'))
+        _opcode_signed_quintuplet(self.DVI_OPCODES, 161, 'y', 'a')
+        _opcode_signed_quintuplet(self.DVI_OPCODES, 166, 'z', 'a')
+        _opcode_mixed_quadruplet(self.DVI_OPCODES, 235,
+                                 _one_parameter_opcode('fnt', 'font_num'))
+        _opcode_mixed_quadruplet(self.DVI_OPCODES, 239, Xxx)
         
-    def test(self):
-        yield Packet(None, 247, VFPre()).parse_stream(self._buffer)
+
+class VFProcessor(VFDVIProcessor):
+    TYPES = ['VF']
+
+    def __init__(self, data = b'', file_type = 'VF'):
+        self.load(data)
+        super().__init__()
+
+        self.CHAR_OPCODES = {}
+        DVICode = OptionalGreedyRange(PacketSwitch('dvi_code',
+                                                   self.DVI_OPCODES))
+        ShortChar = Struct('short_char',
+                           Command('short_char'),
+                           Byte('char_code'),
+                           FixWord(UBInt24('tfm_width')),
+                           Tunnel(Field('dvi_code', lambda ctx: ctx.opcode),
+                                  DVICode))
+        _opcode_range(self.CHAR_OPCODES, 0, 242, ShortChar)
+        self.CHAR_OPCODES[242] = Struct('long_char',
+                                        Command('long_char'),
+                                        SBInt32('dvi_length'),
+                                        SBInt32('char_code'),
+                                        FixWord(SBInt32('tfm_width')),
+                                        Tunnel(
+                                            Field('dvi_code',
+                                                  lambda ctx: ctx.dvi_length),
+                                            DVICode))
+        VFPre = Struct('pre',
+                       Command('pre'),
+                       Magic(b'\312', PreambleError), 
+                       PascalString('comment', encoding = 'ascii'),
+                       SBInt32('checksum'),
+                       FixWord(SBInt32('design_size')))
+        self.Preamble = Packet('pre', 247, VFPre)
+        VFPost = Struct('post',
+                        Command('post'),
+                        Range(0, 3, Magic(b'\370', PostambleError)),
+                        Terminator)
+        self.File = Struct(None,
+                           self.Preamble,
+                           OptionalGreedyRange(
+                               PacketSwitch('fonts', self.FONT_DEF_OPCODES)),
+                           OptionalGreedyRange(
+                               PacketSwitch('chars', self.CHAR_OPCODES)),
+                           Packet('post', 248, VFPost))
+        # commands = {('pre',) : 'pre', ('fnt_def',) : 'fnt_def', ('short_char', 'long_char') : 'char', ('post',) : 'post'}
+        # {x for command in commands for x in command}
+        # {x for x in itertools.chain(*commands)}
+        # transitions = {'pre' : {'start' : 'fonts'}, 
+        #                'fnt_def' : {'fonts': 'fonts'},
+        #                'char' : {'fonts' : 'chars', 'chars' : 'chars'},
+        #                'post' : {'chars' : 'end'}}
+        self.Font = PacketSwitch(None, DictLikeChainMap(self.FONT_DEF_OPCODES, self.CHAR_OPCODES))
+        self.Char = PacketSwitch(None, DictLikeChainMap(self.CHAR_OPCODES, {248 : VFPost}))
+        actions = {'start' : self.Preamble.parse_stream, 'fonts' : Font.parse_stream, 'chars' : Char.parse_stream}
+        transitions = {('pre',): {'start' : 'fonts'}, 
+                       ('fnt_def',) : {'fonts': 'fonts'},
+                       ('short_char', 'long_char') : {'fonts' : 'chars', 
+                                                     'chars' : 'chars'},
+                       ('post',) : {'chars' : 'end'}}
+        t = {command : states for commands, states in transitions.items() for command in commands}
+        a = {command : actions for command in t}
+        self.iterator = dvilike_machine(t, a, self._buffer)
+
+    def __iter__(self):
+        yield self.Preamble.parse_stream(self._buffer)
         while True:
-            packet = self._state0.parse_stream(self._buffer)
+            packet = self.Font.parse_stream(self._buffer)
             yield packet
             if packet.command != 'fnt_def':
                 break
         while True:
-            packet = self._state1.parse_stream(self._buffer)
+            packet = self.Char.parse_stream(self._buffer)
             yield packet
             if packet.command == 'post':
                 self._buffer.seek(0,0)
                 return
 
 
-#            if packet.command != 'short_char' and packet.command != 'long_char':
-#                break
-#        while True:
-#            packet = PacketSwitch(None, self._opcodes2).parse_stream(self._buffer)
-
-        # if self.state == 'start':
-        #     self.state = 'fnt_defs'
-        #     return Packet('pre', 247, VFPre()).parse_stream(self._buffer)
-        # elif self.state == 'fnt_defs':
-        #     packet = PacketSwitch(None, self._opcodes0).parse_stream(self._buffer)
-        #     if packet.command == 'fnt_def':
-        #         return packet
-        #     elif packet.command == 'short_char' or packet.command == 'long_char':
-        #         self.state = 'chars'
-        #         return packet
-        #     else:
-        #         # TODO
-        #         raise ValueError
-        # elif self.state == 'chars':
-        #     return PacketSwitch(None, self._opcodes1).parse_stream(self._buffer)
+# class VFDVIProcessor(DVILikeProcessor):
+#     def __init__(self, data = b''):#         # DVILikeProcessor.__init__(self, data)
+#         self.load(data)
+#         # Opcodes 250-255 aren't allowed either but aren't defined in DVI
+#         self._opcodes = _page_opcodes
+#         self.File = GreedyRange(PacketSwitch(None, self._opcodes))
 
 
-class VFDVITranslator(DVILikeTranslator):
-    def __init__(self, data = b''):
-        # DVILikeTranslator.__init__(self, data)
+class DVIProcessor(VFDVIProcessor):
+    TYPES = ['DVI', 'DVIV', 'XDV']
+
+    def __init__(self, data = b'', file_type = 'DVI'):
+        # DVILikeProcessor.__init__(self, data)
         self.load(data)
-        # Opcodes 250-255 aren't allowed either but aren't defined in DVI
-        self._opcodes = _page_opcodes
-        self._file = GreedyRange(PacketSwitch(None, self._opcodes))
+        # self._temp()
+        super().__init__()
 
+        DVIPre = Struct('pre',
+                        Command('pre'),
+                        Magic(FILE_TYPES[file_type].to_bytes(1, 'big'), 
+                              PreambleError),
+                        SBInt32('numerator'),
+                        SBInt32('denominator'),
+                        SBInt32('magnification'),
+                        PascalString('comment', encoding = 'ascii'))
+        self.BETWEEN_PAGES_OPCODES = DictLikeChainMap(self.FONT_DEF_OPCODES, {138: Pass})
+        self.PAGE_OPCODES = DictLikeChainMap(self.FONT_DEF_OPCODES, self.DVI_OPCODES)
 
-class DVITranslator(DVILikeTranslator):
-    def __init__(self, data = b''):
-        # DVILikeTranslator.__init__(self, data)
-        self.load(data)
-        self._id_byte = b'\2'        
-        # self._opcodes.update(_dvi_opcodes)
-        # self._opcodes[247] = DVIPre(self._id_byte)
-        # self._opcodes[249] = PostPost(self._id_byte)
-        self._post_opcodes = {}
-        self._post_opcodes.update(_fnt_def_opcodes)
-        # _opcode_mixed_quadruplet(self._post_opcodes, 243, FntDef)
-        self._post_opcodes[138] = Pass
-        self._page_opcodes = {}
-        self._page_opcodes.update(_page_opcodes)
-        self._page_opcodes.update(_fnt_def_opcodes)
-        # self._page_opcodes[247] = self.__opcodes[247]
-        # self._page_opcodes[249] = self.__opcodes[249]
-        # _opcode_mixed_quadruplet(self._page_opcodes, 243, FntDef)
-        self.state = 'start'
-        self._file = DVIFormat(self._id_byte, self._post_opcodes, self._page_opcodes)
-        self._opcodes0 = {}
-        self._opcodes0.update(self._post_opcodes)
-        self._opcodes0[139] = Bop()
-        self._opcodes0[248] = DVIPost()
-        self._opcodes1 = {}
-        self._opcodes1.update(self._page_opcodes)
-        self._opcodes1[140] = Struct(None, Command('eop'))
-        self._opcodes2 = {}
-        self._opcodes2.update(self._opcodes0)
-        del self._opcodes2[248]
-        self._opcodes2[249] = PostPost(self._id_byte)
-        self._state0 = PacketSwitch(None, self._opcodes0)
-        self._state1 = PacketSwitch(None, self._opcodes1)
-        self._state2 = PacketSwitch(None, self._opcodes2)
+        if file_type == 'DVIV' or file_type == 'XDV':
+            self.PAGE_OPCODES[255] = Struct('dir', Command('dir'), Flag('dir'))
 
-    def __next__(self):
-        pass
+        if file_type == 'XDV':
+            class TransformMatrix(Adapter):
+                """Converts an array of integers from and to a matrix of floats.
+                
+                Xetex's pic_file command includes a transformation
+                matrix for the image.  The code to read it is in
+                xdvipdfmx's dvi.c in do_pic_file() on lines 1978-1843,
+                with the comment, "transform is a 3x2 affine transform
+                matrix expressed in fixed-point values."  This Adapter
+                wraps an Array of integers.
+                """
+                def _decode(self, obj, context):
+                    return [[float(obj[0])/2**16, float(obj[1])/2**16],
+                            [float(obj[2])/2**16, float(obj[3])/2**16],
+                            [float(obj[4])/2**16, float(obj[5])/2**16]]
+                def _encode(self, obj, context):
+                    return [int(obj[0][0]*2**16), int(obj[0][1]*2**16),
+                            int(obj[1][0]*2**16), int(obj[1][1]*2**16),
+                            int(obj[2][0]*2**16), int(obj[2][1]*2**16)]
+            
+            DefineNativeFont = Struct('define_native_font',
+                                      Command('define_native_font'),
+                                      UBInt32('font_num'),
+                                      UBInt32('point_size'),
+                                      Embed(BitStruct(None,
+                                                      Padding(1),
+                                                      Flag('embolden_flag'),
+                                                      Flag('slant_flag'),
+                                                      Flag('extend_flag'),
+                                                      Flag('variations'),
+                                                      Flag('features'),
+                                                      Flag('colored'),
+                                                      Flag('vertical'),
+                                                      Padding(8))),
+                                      Byte('lenps'),
+                                      Byte('lenfam'),
+                                      Byte('lensty'),
+                                      String('ps_name',
+                                             lambda ctx: ctx.lenps,
+                                             'ascii'),
+                                      String('family',
+                                             lambda ctx: ctx.lenfam,
+                                             'ascii'),
+                                      String('style',
+                                             lambda ctx: ctx.lensty,
+                                             'ascii'),
+                                      If(lambda ctx: ctx.colored,
+                                         UBInt32('rgba')),
+                                      If(lambda ctx: ctx.extend_flag,
+                                         SBInt32('extend')),
+                                      If(lambda ctx: ctx.slant_flag,
+                                         SBInt32('slant')),
+                                      If(lambda ctx: ctx.embolden_flag,
+                                         SBInt32('embolden')),
+                                      If(lambda ctx: ctx.variations,
+                                         Embed(Struct(None,
+                                                      UBInt16('nv'),
+                                                      Array(lambda ctx: ctx.nv,
+                                                            SBInt32('axes')),
+                                                      Array(lambda ctx: ctx.nv,
+                                                            SBInt32('values'))))))
 
-    def test(self):
-        yield Packet(None, 247, DVIPre(self._id_byte)).parse_stream(self._buffer)
+            def SetGlyph(name, construct):
+                return Struct(None,
+                              Command('set_glyph_' + name),
+                              SBInt32('width'),
+                              UBInt16('glyph_count'),
+                              Array(lambda ctx: ctx.glyph_count, construct),
+                              Array(lambda ctx: ctx.glyph_count,
+                                    UBInt16('glyph_id')))
+
+            self.PAGE_OPCODES[251] = Struct('pic_file',
+                                            Command('pic_file'),
+                                            # TODO: This needs some commenting
+                                            # to explain what this byte is,
+                                            # see 1994 of dvi.c
+                                            Byte('pdf_box'),
+                                            TransformMatrix(Array(6,
+                                                                  SBInt32('transform_matrix'))),
+                                            UBInt16('page_number'),
+                                            PascalString('path', UBInt16('length'), 'ascii'))
+
+            self.BETWEEN_PAGES_OPCODES[252] = DefineNativeFont
+            self.PAGE_OPCODES[252] = DefineNativeFont
+            self.PAGE_OPCODES[253] = SetGlyph('array', Struct('loc',
+                                                              SBInt32('x'),
+                                                              SBInt32('y')))
+            self.PAGE_OPCODES[254] = SetGlyph('string', SBInt32('xloc'))
+
+        DVIPost = Struct('post',
+                         Command('post'),
+                         SBInt32('p'),
+                         SBInt32('numerator'),
+                         SBInt32('denominator'),
+                         SBInt32('magnification'),
+                         SBInt32('page_height_plus_depth'),
+                         SBInt32('page_width'),
+                         UBInt16('max_stack_depth'),
+                         UBInt16('total_pages'))
+
+        PostPost = Struct('post_post',
+                          Command('post_post'),
+                          SBInt32('q'),
+                          Magic(FILE_TYPES[file_type].to_bytes(1, 'big'),
+                                PostambleError),
+                          Range(4, 7, Magic(b'\337', PostambleError)),
+                          Terminator)
+
+        Bop = Struct('bop',
+                     Command('bop'),
+                     Array(10, SBInt32('c')),
+                     SBInt32('p'))
+
+        self.Preamble = Packet('pre', 247, DVIPre)
+
+        def BetweenPages(name):
+            return PacketSwitch(name, self.BETWEEN_PAGES_OPCODES)
+
+        self.File = Struct(None,
+                           self.Preamble,
+                           OptionalGreedyRange(BetweenPages('before_pages')),
+                           # The names in a Sequence are meaningless,
+                           # but for some reason they can't be None,
+                           # so I used one-element strings.
+                           OptionalGreedyRange(Sequence('page',
+                                                        Packet('a', 139, Bop),
+                                                        OptionalGreedyRange(PacketSwitch('b', self.PAGE_OPCODES)),
+                                                        Packet('c', 140, Struct('eop', Command('eop'))),
+                                                        OptionalGreedyRange(BetweenPages('d')))),
+                           Packet('post', 248, DVIPost),
+                           OptionalGreedyRange(BetweenPages('fonts')),
+                           Packet('post_post', 249, PostPost))
+        # commands = {('pre',) : 'pre',
+        #             ('fnt_def',) : 'fnt_def',
+        #             ('set_char', 'set', 'set_rule', 'put', 'put_rule', 'push', 'right', 'w', 'x', 'down', 'y', 'z', 'fnt_num', 'fnt', 'xxx') : 'page_op',
+        #             ('bop',) : 'bop',
+        #             ('eop',) : 'eop',
+        #             ('post',) : 'post',
+        #             ('post_post',) : 'post_post'}
+        # transitions = {'pre' : {'start' : 'between_pages'}, 
+        #                'bop' : {'between_pages' : 'in_page'},
+        #                'page_op' : {'in_page' : 'in_page'},
+        #                'eop' : {'in_page', 'between_pages'},
+        #                'fnt_def' : {'in_page' : 'in_page', 'between_pages' : 'between_pages', 'fonts' : 'fonts'}
+        #                'post' : {'between_pages' : 'fonts'},
+        #                'post_post' : {'fonts' : 'end'}}
+
+        self.BetweenPagesTwo = PacketSwitch(None, self.BETWEEN_PAGES_OPCODES.new_child({139 : Bop, 248 : DVIPost}))
+        self.InPage = PacketSwitch(None, self.PAGE_OPCODES.new_child({140 : Struct('eop', Command('eop'))}))
+        self.Postamble = PacketSwitch(None, self.BETWEEN_PAGES_OPCODES.new_child({249: PostPost}))
+        actions = {'start' : self.Preamble.parse_stream, 'between_pages' : self.BetweenPagesTwo.parse_stream, 'in_page' : self.InPage.parse_stream, 'postamble' : self.Postamble.parse_stream}
+        transitions = {('pre',) : {'start' : 'between_pages'}, 
+                       ('bop',) : {'between_pages' : 'in_page'},
+                       ('set_char', 'set', 'set_rule', 'put', 'put_rule', 'push', 'right', 'w', 'x', 'down', 'y', 'z', 'fnt_num', 'fnt', 'xxx') : {'in_page' : 'in_page'},
+                       ('eop',) : {'in_page', 'between_pages'},
+                       ('fnt_def',) : {'in_page' : 'in_page', 'between_pages' : 'between_pages', 'postamble' : 'postamble'},
+                       ('post',) : {'between_pages' : 'postamble'},
+                       ('post_post',) : {'postamble' : 'end'}}
+        t = {command : states for commands, states in transitions.items() for command in commands}
+        a = {command : actions for command in t}
+
+    def __iter__(self):
+        yield self.Preamble.parse_stream(self._buffer)
         while True:
             while True:
-                packet = self._state0.parse_stream(self._buffer)
+                packet = self.BetweenPagesTwo.parse_stream(self._buffer)
                 yield packet
                 if packet is not None and (packet.command == 'bop' or packet.command == 'post'):
                     break
             while packet.command != 'post':
-                packet = self._state1.parse_stream(self._buffer)
+                packet = self.InPage.parse_stream(self._buffer)
                 yield packet
                 if packet.command == 'eop':
                     break
@@ -751,42 +853,11 @@ class DVITranslator(DVILikeTranslator):
                 break
         while True:
             print(packet.command)
-            packet = self._state2.parse_stream(self._buffer)                
+            packet = self.Postamble.parse_stream(self._buffer)                
             yield packet
             if packet is not None and packet.command == 'post_post':
                 self._buffer.seek(0,0)
                 return
-
-#        if self.state == 'start':
-#            self.state = 'between_pages'
-#            return Packet(None, 247, DVIPre(self._id_byte)).parse_stream(self._buffer)
-#        elif self.state == 'between_pages':
-#            packet = PacketSwitch(None, self._opcodes0).parse_stream(self._buffer)
-#            if packet.command == 'fnt_def':
-#                return packet
-#            elif packet is None:
-#                pass
-#            elif packet.command == 'bop':
-#                self.state = 'in_page'
-#                return packet
-#            elif packet.command == 'post':
-#                self.state = 'fnt_defs'
-#                return packet
-#            elif self.state == 'in_page':
-#                packet = self.PacketSwitch(None, self._opcodes1).parse_stream(self._buffer)
-#                if packet.command == 'eop':
-#                    self.state = 'between_pages'
-#                    return packet
-#                else:
-#                    return packet
-#            elif self.state == 'fnt_defs':
-#                packet = PacketSwitch(None, self._opcodes2).parse_stream(self._buffer)
-#                if packet.command == 'fnt_def':
-#                    return packet
-#                elif packet is None:
-#                    pass
-#                elif packet.command == 'post_post':
-#                    return packet
 
     def postamble(self):
         print(self._buffer.seek(-1, 2))
@@ -808,29 +879,36 @@ class DVITranslator(DVILikeTranslator):
             yield RepeatUntil(lambda obj, ctx: obj.command == 'eop', PacketSwitch(None, self._page_opcodes)).parse_stream(self._buffer)
 
 
-class DVIVTranslator(DVITranslator):
-    def __init__(self, data = b''):
-        DVITranslator.__init__(self, data)
-        self._id_byte = b'\3'
-        self._page_opcodes[255] = Struct(None, Command('dir'), Flag('dir'))
-        self._file = DVIFormat(self._id_byte, self._post_opcodes, self._page_opcodes)
-        self._opcodes0[248] = DVIPost()
-        self._opcodes1[255] = Struct(None, Command('dir'), Flag('dir'))
-        self._opcodes2[249] = PostPost(self._id_byte)
+class PKProcessor(DVILikeProcessor):
+    TYPES = ['PK']
+    
+    def __init__(self, data = b'', file_type = 'PK'):
+        raise NotImplementedError
 
 
-class XDVTranslator(DVIVTranslator):
-    def __init__(self, data = b''):
-        DVIVTranslator.__init__(self, data)
-        self._id_byte = b'\5'
-        self._page_opcodes.update(_xdv_opcodes)
-        self._post_opcodes[252] = DefineNativeFont()
-        self._file = DVIFormat(self._id_byte, self._post_opcodes, self._page_opcodes)
-        self._opcodes0[248] = DVIPost()
-        self._opcodes0[252] = DefineNativeFont()
-        self._opcodes1.update(_xdv_opcodes)
-        self._opcodes2[249] = PostPost(self._id_byte)
-        self._opcodes2[252] = DefineNativeFont()
+# class DVIVProcessor(DVIProcessor):
+#     def __init__(self, data = b''):
+#         DVIProcessor.__init__(self, data)
+#         self._id_byte = b'\3'
+#         self._page_opcodes[255] = Struct(None, Command('dir'), Flag('dir'))
+#         self.File = DVIFormat(self._id_byte, self._post_opcodes, self._page_opcodes)
+#         self._opcodes0[248] = DVIPost()
+#         self._opcodes1[255] = Struct(None, Command('dir'), Flag('dir'))
+#         self._opcodes2[249] = PostPost(self._id_byte)
+
+
+# class XDVProcessor(DVIVProcessor):
+#     def __init__(self, data = b''):
+#         DVIVProcessor.__init__(self, data)
+#         self._id_byte = b'\5'
+#         self._page_opcodes.update(_xdv_opcodes)
+#         self._post_opcodes[252] = DefineNativeFont()
+#         self.File = DVIFormat(self._id_byte, self._post_opcodes, self._page_opcodes)
+#         self._opcodes0[248] = DVIPost()
+#         self._opcodes0[252] = DefineNativeFont()
+#         self._opcodes1.update(_xdv_opcodes)
+#         self._opcodes2[249] = PostPost(self._id_byte)
+#         self._opcodes2[252] = DefineNativeFont()
 
 # http://stackoverflow.com/questions/2101961/python-state-machine-design#answer-2102001
 
@@ -847,32 +925,93 @@ class XDVTranslator(DVIVTranslator):
 # http://ocw.mit.edu/courses/electrical-engineering-and-computer-science/6-01sc-introduction-to-electrical-engineering-and-computer-science-i-spring-2011/unit-1-software-engineering/state-machines/MIT6_01SCS11_chap04.pdf
 
 
+def coroutine(func):
+    def primed(*args, **kwargs):
+        cr = func(*args, **kwargs)
+        cr.send(None)
+        return cr
+    return primed
+
+
+class UndefinedActionError(Exception):
+    pass
+class IllegalTransitionError(Exception):
+    pass
+
+# There are two different use cases here with contradictory
+# restraints: for the state machines in the parser, the actions are
+# tied to the states, but for the transformer, they're tied to the
+# commands.  There's shared code, though, so the special-casing should
+# be done outside the state machine coroutine.
+@coroutine
+def dvilike_machine(transitions, actions, start = 'start', **state_vars):
+    """No.
+
+    transitions: Dictionary mapping commands (strings) to dictionaries
+    mapping states (strings) to a state (a string).
+
+    actions: Dictionary mapping commands (strings) to dictionaries
+    mapping states to an action (a function).
+
+    start: The start state (a string).
+
+    """
+    # at = {}
+    # for command in a:
+    #     for state in a:
+    #         at[command][state] = {}
+    #         at[command][state][action] = a if a[command][state]
+    #         at[command][state][transition] = t if t[command][state]
+
+    # at = {
+    #     command: {
+    #         state: [transitions[command][state], actions[state]]
+    #         for state in {x for x in itertools.chain(*transitions)}
+    #     }
+    #     for command in {x for x in itertools.chain(*commands)}
+    # }
+
+    state = start
+
+    while True:
+        command = (yield)
+        try:
+            state = transitions[command][state]
+        except KeyError as e:
+            raise IllegalTransitionError(e)
+        try:
+            state_vars = actions[command][state](**state_vars)
+        except KeyError as e:
+            raise UndefinedActionError(e)
+
+
 class DVILikeMachine:
+    """
+
+    events: Dictionary mapping tuples of commands (strings) to events
+    (strings) for the state machine.  All commands the state machine
+    accepts must be keys in this dictionary.  Passing any command not
+    in this dictionary to the state machine will cause it to raise an
+    exception.
+    
+    transitions: Dictionary mapping events (strings) to dictionaries
+    mapping states (strings) to states (strings).
+
+    actions: Dictionary mapping commands (strings) to
+    actions (functions).
+    The default method for a command is the method
+    with the same name as the command---this dictionary allows you to
+    override that.  If a method doesn't exist, the default method is
+    called instead.  The default for the default method is to do
+    nothing, but this can also be overriden.
+    """
+
     def __init__(self, events, transitions, actions):
-        """
-        events: Dictionary mapping commands (strings) to events
-        (strings) for the state machine.  All commands the state
-        machine accepts must be keys in this dictionary.  Passing any
-        command not in this dictionary to the state machine will cause
-        it to raise an exception.
-
-        transitions: Dictionary mapping events (strings) to
-        dictionaries mapping states (strings) to states (strings).
-
-        actions: Dictionary mapping (strings) of commands
-        (strings) to actions (methods).  The default method for a
-        command is the method with the same name as the command---this
-        dictionary allows you to override that.  If a method doesn't
-        exist, the default method is called instead.  The default for
-        the default method is to do nothing, but this can also be
-        overriden.
-        """
         self._events = events
         self._transitions = transitions
         self._actions = actions
 
     def __call__(self, container):
-        
         try:
             func = getattr(self, 'do_' + cmd)
         except AttributeError:
@@ -988,26 +1127,33 @@ class OpcodeCommandsMachine:
         raise NotImplementedError        
 
 
-# file = 'DroidSerif-Regular-ot1.vf'
-file = 'extending_hardys_proof.dvi'
-# file = 'testsuite/F-alias-feature-option.xdv'
-# file = '02_xits_fonts.xdv'
 
-with open(file, 'rb') as f:
-    # for x in VFTranslator(f):
-    # for x in DVITranslator(f):
-    # for x in XDVTranslator(f):
-    # for x in VFTranslator(f).test():
-    for x in DVITranslator(f).test():
-        print(x)
-    # test = VFTranslator(f)
-    # test = DVITranslator(f)
-    # test = XDVTranslator(f)
-    # print(test.read_file(f))
-    # print(test.postamble())
-    # i = 0
-    # for x in test.pages():
-    #     i = i + 1
-    #     print('Page ' + str(i))
-    #     for y in x:
-    #         print(y)
+if __name__ == "__main__":
+
+    # file = 'DroidSerif-Regular-ot1.vf'
+    # file = 'extending_hardys_proof.dvi'
+    # file = 'testsuite/F-alias-feature-option.xdv'
+    # file = '02_xits_fonts.xdv'
+    # file = 'droid-test.dvi'
+    file = 'pcml-16.dvi'
+
+    with open(file, 'rb') as f:
+        test = DVILikeProcessor.Process(f)
+        # t = test.read_file(f)
+        for x in test:
+        # tracker = pympler.classtracker.ClassTracker()
+        # tracker.track_class(Container)
+        # tracker.track_class(ListContainer)
+        #     print(x)
+        # print(test.read_file(f))
+        # for x in t.itervalues():
+            print(x)
+            # print(pympler.asizeof.asizeof(x, stats = 1), pympler.asizeof.leng(x))
+        # print(asizeof(t, stats = 1), leng(t))
+        # print(test.postamble())
+        # i = 0
+        # for x in test.pages():
+        #     i = i + 1
+        #     print('Page ' + str(i))
+        #     for y in x:
+        #         print(y)
