@@ -50,3 +50,7 @@ existing implementations in Python at all as far as I know.
 The parser itself is a single script, dvilike.py.  It requires the
 Construct binary parsing library
 (https://pypi.python.org/pypi/construct).
+
+## License
+
+MIT.
